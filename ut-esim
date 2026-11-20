@@ -1,6 +1,6 @@
 #!/bin/bash
 # ut-esim - eSIM profile manager for Ubuntu Touch (wrapper around lpac)
-# https://github.com/<user>/ut-esim
+# https://github.com/sandrrei/ut-esim
 # SPDX-License-Identifier: MIT
 
 set -u

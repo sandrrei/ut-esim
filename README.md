@@ -83,7 +83,17 @@ What the build script takes care of:
 
 ## Installation on the phone
 
-1. Copy `lpac-ut.tar.gz` and the `ut-esim` script to the phone. For example, over the local network:
+**The script** can be installed straight from this repository:
+
+```bash
+mkdir -p ~/.local/bin
+wget -O ~/.local/bin/ut-esim https://raw.githubusercontent.com/sandrrei/ut-esim/main/ut-esim
+chmod 755 ~/.local/bin/ut-esim
+```
+
+**lpac** has to be built first (see [Building lpac](#building-lpac)) until prebuilt releases are available.
+
+1. Copy `lpac-ut.tar.gz` (and the `ut-esim` script, if you did not download it as above) to the phone. For example, over the local network:
 
    ```bash
    # on the build machine
