@@ -1,0 +1,299 @@
+#!/bin/bash
+# ut-esim - eSIM profile manager for Ubuntu Touch (wrapper around lpac)
+# https://github.com/<user>/ut-esim
+# SPDX-License-Identifier: MIT
+
+set -u
+
+VERSION="0.1.0"
+
+# ---------------------------------------------------------------------------
+# Settings (can be overridden from the environment)
+# ---------------------------------------------------------------------------
+LPAC_HOME="${LPAC_HOME:-/home/phablet/.local/lpac}"
+LPAC_BIN="${LPAC_BIN:-$LPAC_HOME/bin/lpac}"
+UT_ESIM_PCSCD="${UT_ESIM_PCSCD:-$LPAC_HOME/sbin/pcscd}"
+
+MODE="slot"        # slot | usb
+SLOT=""            # gbinder UIM slot (1, 2, ...); empty = auto
+READER=""          # PC/SC reader index for --usb
+JSON=0             # print raw lpac JSON
+ASSUME_YES=0
+CONFIRM_CODE=""
+STARTED_PCSCD=0
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+die()  { echo "ut-esim: $*" >&2; exit 1; }
+info() { echo ":: $*" >&2; }
+
+usage() {
+    cat <<EOF
+ut-esim $VERSION - eSIM profile manager for Ubuntu Touch
+
+Usage: ut-esim [options] <command> [arguments]
+
+Commands:
+  info                       Show eUICC information (EID, free memory)
+  list                       List installed profiles
+  add <activation-code>      Download a profile ('LPA:1\$smdp\$matching-id')
+  enable <ICCID>             Enable a profile
+  disable <ICCID>            Disable a profile
+  delete <ICCID>             Delete a profile (permanent!)
+  nickname <ICCID> <name>    Set a profile nickname
+  notify                     Send pending notifications to the operator
+  drivers                    List the lpac drivers that were found
+  raw <lpac arguments...>    Run lpac directly with the selected backend
+
+Options:
+  --usb                      Use a USB PC/SC card reader instead of the SIM slot
+  --slot <n>                 SIM slot to use in slot mode (default: auto)
+  --reader <n>               Reader index in USB mode (see 'ut-esim --usb drivers')
+  --confirm <code>           Confirmation code for 'add' (if the operator gave one)
+  --json                     Print the raw lpac JSON output
+  -y, --yes                  Do not ask for confirmation
+  -h, --help                 Show this help
+  -V, --version              Show the version
+
+Always put the activation code in single quotes, otherwise the shell eats the '\$'.
+EOF
+}
+
+# Re-run as root (the radio service and pcscd need it), keeping our settings.
+ensure_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        exec sudo LPAC_HOME="$LPAC_HOME" LPAC_BIN="$LPAC_BIN" UT_ESIM_PCSCD="$UT_ESIM_PCSCD" "$0" "${ORIG_ARGS[@]}"
+    fi
+}
+
+check_lpac() {
+    [ -x "$LPAC_BIN" ] || die "lpac not found at $LPAC_BIN (set LPAC_HOME or LPAC_BIN)"
+}
+
+# Export the lpac backend variables for the selected mode.
+setup_backend() {
+    if [ "$MODE" = "usb" ]; then
+        export LPAC_APDU=pcsc
+        [ -n "$READER" ] && export LPAC_APDU_PCSC_DRV_IFID="$READER"
+        start_pcscd
+    else
+        export LPAC_APDU=gbinder
+        [ -n "$SLOT" ] && export LPAC_APDU_GBINDER_UIM_SLOT="$SLOT"
+    fi
+    export LPAC_HTTP=curl
+}
+
+start_pcscd() {
+    if pgrep -x pcscd >/dev/null 2>&1; then
+        return
+    fi
+    [ -x "$UT_ESIM_PCSCD" ] || die "USB mode needs pcscd; not found at $UT_ESIM_PCSCD (see README, 'Full build')"
+    info "starting pcscd"
+    "$UT_ESIM_PCSCD" --auto-exit >/dev/null 2>&1 &
+    STARTED_PCSCD=1
+    sleep 1
+}
+
+stop_pcscd() {
+    if [ "$STARTED_PCSCD" -eq 1 ]; then
+        pkill -x pcscd >/dev/null 2>&1 || true
+    fi
+}
+trap stop_pcscd EXIT
+
+# Run lpac and keep its output. Prints a readable summary unless --json.
+# $1 = formatter name (info|list|plain), rest = lpac arguments.
+run_lpac() {
+    local fmt="$1"; shift
+    local out rc
+    out="$("$LPAC_BIN" "$@" 2>&1)"
+    rc=$?
+    if [ "$JSON" -eq 1 ]; then
+        printf '%s\n' "$out"
+        return $rc
+    fi
+    printf '%s\n' "$out" | python3 -c '
+import json, sys
+
+fmt = sys.argv[1]
+result = None
+progress = []
+other = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        other.append(line)
+        continue
+    if obj.get("type") == "lpa":
+        result = obj.get("payload", {})
+    elif obj.get("type") == "progress":
+        progress.append(obj.get("payload", {}).get("message", ""))
+    elif obj.get("type") == "driver":
+        result = {"code": 0, "data": obj.get("payload")}
+
+if result is None:
+    for l in other:
+        print(l)
+    print("error: no result from lpac", file=sys.stderr)
+    sys.exit(1)
+
+code = result.get("code", -1)
+data = result.get("data")
+
+if code != 0:
+    step = result.get("message", "")
+    print("FAILED at step: %s" % step, file=sys.stderr)
+    if data:
+        print("reason: %s" % (json.dumps(data) if not isinstance(data, str) else data), file=sys.stderr)
+    for l in other:
+        print("  " + l, file=sys.stderr)
+    text = json.dumps(data) if data else ""
+    if step == "es9p_authenticate_client" or "8.2.6" in text:
+        print("hint: the operator refused this code for this card. It may be already used,", file=sys.stderr)
+        print("      issued for another device (EID), or the operator may not accept removable eSIMs.", file=sys.stderr)
+    elif "HTTP transport failed" in text:
+        print("hint: could not reach the SM-DP+ server - check the address in the code and the internet connection.", file=sys.stderr)
+    elif "logical channel" in " ".join(other).lower():
+        print("hint: try another slot with --slot 1 or --slot 2, or use a USB reader with --usb.", file=sys.stderr)
+    sys.exit(2)
+
+if fmt == "info":
+    d = data or {}
+    i2 = d.get("EUICCInfo2") or {}
+    res = i2.get("extCardResource") or {}
+    print("EID:              %s" % d.get("eidValue"))
+    print("Free memory:      %s KB" % (int(res.get("freeNonVolatileMemory", 0)) // 1024))
+    print("eUICC firmware:   %s" % i2.get("euiccFirmwareVer"))
+    print("SGP.22 version:   %s" % i2.get("svn"))
+elif fmt == "list":
+    profiles = data or []
+    if not profiles:
+        print("No profiles installed.")
+    else:
+        print("%-22s %-9s %-14s %s" % ("ICCID", "STATE", "PROVIDER", "NAME / NICKNAME"))
+        for p in profiles:
+            name = p.get("profileName") or ""
+            nick = p.get("profileNickname")
+            if nick:
+                name = "%s (%s)" % (name, nick)
+            print("%-22s %-9s %-14s %s" % (p.get("iccid"), p.get("profileState"),
+                                           p.get("serviceProviderName") or "", name))
+elif fmt == "drivers":
+    d = data or {}
+    for k, v in d.items():
+        print("%s: %s" % (k, ", ".join(v) if isinstance(v, list) else v))
+else:
+    print("OK")
+' "$fmt"
+}
+
+confirm() {
+    [ "$ASSUME_YES" -eq 1 ] && return 0
+    local answer
+    read -r -p "$1 [y/N] " answer
+    case "$answer" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+process_notifications() {
+    info "sending notifications to the operator"
+    run_lpac plain notification process -a -r || info "notifications not sent (you can retry with 'ut-esim notify')"
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+ORIG_ARGS=("$@")
+ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --usb)      MODE="usb" ;;
+        --slot)     SLOT="${2:-}"; shift ;;
+        --reader)   READER="${2:-}"; shift ;;
+        --confirm)  CONFIRM_CODE="${2:-}"; shift ;;
+        --json)     JSON=1 ;;
+        -y|--yes)   ASSUME_YES=1 ;;
+        -h|--help)  usage; exit 0 ;;
+        -V|--version) echo "ut-esim $VERSION"; exit 0 ;;
+        raw)        ARGS+=("$@"); break ;;
+        *)          ARGS+=("$1") ;;
+    esac
+    shift
+done
+
+[ ${#ARGS[@]} -gt 0 ] || { usage; exit 1; }
+CMD="${ARGS[0]}"
+
+ensure_root
+check_lpac
+setup_backend
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+case "$CMD" in
+    info)
+        run_lpac info chip info
+        ;;
+    list)
+        run_lpac list profile list
+        ;;
+    add)
+        CODE="${ARGS[1]:-}"
+        [ -n "$CODE" ] || die "usage: ut-esim add 'LPA:1\$smdp-address\$matching-id'"
+        case "$CODE" in
+            LPA:1\$*\$*) ;;
+            *) die "the activation code must look like 'LPA:1\$smdp-address\$matching-id' (did you use single quotes?)" ;;
+        esac
+        SMDP="$(printf '%s' "$CODE" | cut -d'$' -f2)"
+        if ! getent hosts "$SMDP" >/dev/null 2>&1; then
+            die "cannot resolve SM-DP+ address '$SMDP' - check the code (and your internet connection)"
+        fi
+        info "downloading profile from $SMDP"
+        if [ -n "$CONFIRM_CODE" ]; then
+            run_lpac plain profile download -a "$CODE" -c "$CONFIRM_CODE" || exit $?
+        else
+            run_lpac plain profile download -a "$CODE" || exit $?
+        fi
+        process_notifications
+        run_lpac list profile list
+        echo "The new profile is disabled. Enable it with: ut-esim enable <ICCID>"
+        ;;
+    enable|disable)
+        ICCID="${ARGS[1]:-}"
+        [ -n "$ICCID" ] || die "usage: ut-esim $CMD <ICCID>"
+        run_lpac plain profile "$CMD" "$ICCID" || exit $?
+        process_notifications
+        echo "Done. If the network does not change within a minute, restart the phone."
+        ;;
+    delete)
+        ICCID="${ARGS[1]:-}"
+        [ -n "$ICCID" ] || die "usage: ut-esim delete <ICCID>"
+        echo "Deleting a profile is PERMANENT. To get it back the operator must issue a new code."
+        confirm "Delete profile $ICCID?" || die "cancelled"
+        run_lpac plain profile delete "$ICCID" || exit $?
+        process_notifications
+        ;;
+    nickname)
+        ICCID="${ARGS[1]:-}"; NAME="${ARGS[2]:-}"
+        [ -n "$ICCID" ] && [ -n "$NAME" ] || die "usage: ut-esim nickname <ICCID> <name>"
+        run_lpac plain profile nickname "$ICCID" "$NAME"
+        ;;
+    notify)
+        run_lpac plain notification process -a -r
+        ;;
+    drivers)
+        run_lpac drivers driver list
+        ;;
+    raw)
+        JSON=1
+        run_lpac plain "${ARGS[@]:1}"
+        ;;
+    *)
+        die "unknown command '$CMD' (see 'ut-esim --help')"
+        ;;
+esac
